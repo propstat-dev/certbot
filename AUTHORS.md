@@ -9,6 +9,7 @@ Authors
 * [Adrien Ferrand](https://github.com/adferrand)
 * [Aidin Gharibnavaz](https://github.com/aidin36)
 * [AJ ONeal](https://github.com/coolaj86)
+* [Alba Mendez](https://github.com/mildsunrise)
 * [Alcaro](https://github.com/Alcaro)
 * [Alexander Mankuta](https://github.com/pointlessone)
 * [Alex Bowers](https://github.com/alexbowers)
@@ -138,6 +139,7 @@ Authors
 * [Joe Ranweiler](https://github.com/ranweiler)
 * [Joerg Sonnenberger](https://github.com/jsonn)
 * [John Leach](https://github.com/johnl)
+* [John Muirhead-Gould](https://github.com/jmg421)
 * [John Reed](https://github.com/leerspace)
 * [Jonas Berlin](https://github.com/xkr47)
 * [Jonathan Herlin](https://github.com/Jonher937)
@@ -228,6 +230,8 @@ Authors
 * [Piotr Kasprzyk](https://github.com/kwadrat)
 * [Prayag Verma](https://github.com/pra85)
 * [Preston Locke](https://github.com/Preston12321)
+* [Propstat](https://github.com/propstat)
+* [Propstat DEV Team](https://github.com/propstat-dev)
 * [Q Misell][https://magicalcodewit.ch]
 * [Rasesh Patel](https://github.com/raspat1)
 * [Reinaldo de Souza Jr](https://github.com/juniorz)
@@ -307,4 +311,3 @@ Authors
 * [Zach Shepherd](https://github.com/zjs)
 * [陈三](https://github.com/chenxsan)
 * [Shahar Naveh](https://github.com/ShaharNaveh)
-

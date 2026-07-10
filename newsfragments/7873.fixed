@@ -1,0 +1,12 @@
+The Route53 DNS challenge implementation proofed to be 
+significantly more challenging than other DNS providers 
+due to the close connection to the boto3 library provided
+by Amazon / AWS. BOTO3 expected particular file formats 
+for credentials that were not conform to the standard .ini
+formats and located frequently in locations differing from
+standard locations resulting in failed renewal attempts
+without additional configuration. This PR fixes those issues
+by adding support for default certbot style credential 
+.ini files.
+
+Fixes #10593
