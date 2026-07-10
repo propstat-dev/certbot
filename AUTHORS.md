@@ -88,6 +88,7 @@ Authors
 * [Erik Rose](https://github.com/erikrose)
 * [Eugene Kazakov](https://github.com/xgin)
 * [Fabian](https://github.com/faerbit)
+* [Fabian V. Thobe](https://github.com/fthobe)
 * [Faidon Liambotis](https://github.com/paravoid)
 * [Fan Jiang](https://github.com/tcz001)
 * [Felix Lechner](https://github.com/lechner)
@@ -138,6 +139,7 @@ Authors
 * [Joe Ranweiler](https://github.com/ranweiler)
 * [Joerg Sonnenberger](https://github.com/jsonn)
 * [John Leach](https://github.com/johnl)
+* [John Muirhead-Gould](https://github.com/jmg421)
 * [John Reed](https://github.com/leerspace)
 * [Jonas Berlin](https://github.com/xkr47)
 * [Jonathan Herlin](https://github.com/Jonher937)
@@ -228,6 +230,8 @@ Authors
 * [Piotr Kasprzyk](https://github.com/kwadrat)
 * [Prayag Verma](https://github.com/pra85)
 * [Preston Locke](https://github.com/Preston12321)
+* [Propstat](https://github.com/propstat)
+* [Propstat DEV Team](https://github.com/propstat-dev)
 * [Q Misell][https://magicalcodewit.ch]
 * [Rasesh Patel](https://github.com/raspat1)
 * [Reinaldo de Souza Jr](https://github.com/juniorz)
@@ -307,4 +311,3 @@ Authors
 * [Zach Shepherd](https://github.com/zjs)
 * [陈三](https://github.com/chenxsan)
 * [Shahar Naveh](https://github.com/ShaharNaveh)
-
