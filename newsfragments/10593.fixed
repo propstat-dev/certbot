@@ -1,0 +1,9 @@
+Fix dns-route53 duplicate TXT record for apex + wildcard
+When an ACME CA returns identical DNS-01 challenge values for both
+apex and wildcard domains (same validation_domain_name and value),
+Route53 rejects the second UPSERT as a duplicate resource record.
+
+Skip the API call when the challenge value already exists in the
+tracked resource records, returning the previously stored change ID.
+
+Fixes #10593
