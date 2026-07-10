@@ -1,6 +1,7 @@
 """Tests for certbot_dns_route53._internal.dns_route53.Authenticator"""
 
 import sys
+import socket
 import tempfile
 import unittest
 from typing import Any
@@ -95,49 +96,19 @@ class AuthenticatorTest(unittest.TestCase):
             os.unlink(credentials_file.name)
 
     def test_credentials_file_with_inline_configs(self) -> None:
+        """No [section] header required, an inline dns_route53_region
+        override flows through to region_name, and a stray line with no
+        '=' is tolerated rather than breaking parsing."""
         from certbot_dns_route53._internal.dns_route53 import Authenticator
 
-        custom_creds = """[default]
-dns_route53_profile=production
-dns_route53_region=us-east-1
-
-[production]
-aws_access_key_id=AKIAIOSFODNN7EXAMPLE
-aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-"""
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
-            credentials_file.write(custom_creds)
-            credentials_file.close()
-
-        try:
-            self.config.route53_credentials = credentials_file.name
-
-            with mock.patch(
-                "certbot_dns_route53._internal.dns_route53.boto3.client"
-            ) as mock_client:
-                Authenticator(self.config, "route53")
-
-                mock_client.assert_called_once_with(
-                    "route53",
-                    aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
-                    aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-                    aws_session_token=None,
-                    region_name="us-east-1",
-                )
-        finally:
-            os.unlink(credentials_file.name)
-
-    def test_credentials_file_no_section_header(self) -> None:
-        from certbot_dns_route53._internal.dns_route53 import Authenticator
-
-        flat_creds = """aws_access_key_id=AKIAIOSFODNN7EXAMPLE
+        custom_creds = """aws_access_key_id=AKIAIOSFODNN7EXAMPLE
 aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 dns_route53_profile=production
 dns_route53_region=us-east-1
 this line has no equals sign and should just be skipped
 """
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
-            credentials_file.write(flat_creds)
+            credentials_file.write(custom_creds)
             credentials_file.close()
 
         try:
@@ -167,43 +138,6 @@ this line has no equals sign and should just be skipped
             with self.assertRaises(errors.PluginError):
                 Authenticator(self.config, "route53")
 
-    def test_awscredentials_file_selects_profile_section(self) -> None:
-        """--dns-route53-awscredentials must correctly distinguish between
-        multiple, genuinely different credential sets in one file, selecting
-        the section matching --dns-route53-profile."""
-        from certbot_dns_route53._internal.dns_route53 import Authenticator
-
-        multi_profile_creds = """[default]
-aws_access_key_id = AKIA_DEFAULT_ACCOUNT_KEY
-aws_secret_access_key = default_account_secret
-
-[production]
-aws_access_key_id = AKIA_PRODUCTION_ACCOUNT_KEY
-aws_secret_access_key = production_account_secret
-"""
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
-            credentials_file.write(multi_profile_creds)
-            credentials_file.close()
-
-        try:
-            self.config.route53_awscredentials = credentials_file.name
-            self.config.route53_profile = "production"
-
-            with mock.patch(
-                "certbot_dns_route53._internal.dns_route53.boto3.client"
-            ) as mock_client:
-                Authenticator(self.config, "route53")
-
-                mock_client.assert_called_once_with(
-                    "route53",
-                    aws_access_key_id="AKIA_PRODUCTION_ACCOUNT_KEY",
-                    aws_secret_access_key="production_account_secret",
-                    aws_session_token=None,
-                    region_name=None,
-                )
-        finally:
-            os.unlink(credentials_file.name)
-
     def test_awscredentials_file_inline_profile_pointer(self) -> None:
         """--dns-route53-awscredentials with the profile/region specified
         inline (in [default]) rather than via a CLI flag."""
@@ -225,17 +159,14 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
             self.config.route53_awscredentials = credentials_file.name
 
             with mock.patch(
-                "certbot_dns_route53._internal.dns_route53.boto3.client"
-            ) as mock_client:
+                "certbot_dns_route53._internal.dns_route53.boto3.Session"
+            ) as mock_session:
                 Authenticator(self.config, "route53")
 
-                mock_client.assert_called_once_with(
-                    "route53",
-                    aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
-                    aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-                    aws_session_token=None,
-                    region_name="us-east-1",
+                mock_session.assert_called_once_with(
+                    profile_name="production", region_name="us-east-1",
                 )
+                mock_session.return_value.client.assert_called_once_with("route53")
         finally:
             os.unlink(credentials_file.name)
 
@@ -401,8 +332,9 @@ aws_session_token=FQoGZXIvYXdzEXAMPLETOKEN
 
     def test_awscredentials_file_unreadable_inline_scan_is_tolerant(self) -> None:
         """The inline profile/region scan for --dns-route53-awscredentials
-        should tolerate a read failure rather than crash -- SharedCredentialProvider
-        still gets the chance to raise its own, clearer error afterward."""
+        should tolerate a read failure rather than crash -- boto3's own
+        credential resolution still gets the chance to raise its own,
+        clearer error afterward."""
         from certbot_dns_route53._internal.dns_route53 import Authenticator
 
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
@@ -422,6 +354,318 @@ aws_session_token=FQoGZXIvYXdzEXAMPLETOKEN
                 return real_open(path, *args, **kwargs)
 
             with mock.patch("builtins.open", side_effect=flaky_open):
+                with self.assertRaises(errors.PluginError):
+                    Authenticator(self.config, "route53")
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_awscredentials_file_real_resolution_selects_correct_profile(self) -> None:
+        """End-to-end, with no boto3 mocking: a real multi-section
+        AWS-style file resolves the actual keys for the requested profile,
+        not just the right constructor arguments. setUp() already leaves
+        AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY set to dummy values in the
+        environment for every test in this class, so this also doubles as
+        an end-to-end check that those ambient values don't leak into the
+        resolved client instead of the file's real keys."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        multi_profile_creds = """[default]
+aws_access_key_id = AKIA_DEFAULT_ACCOUNT_KEY
+aws_secret_access_key = default_account_secret
+
+[production]
+aws_access_key_id = AKIA_PRODUCTION_ACCOUNT_KEY
+aws_secret_access_key = production_account_secret
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(multi_profile_creds)
+            credentials_file.close()
+
+        try:
+            self.config.route53_awscredentials = credentials_file.name
+            self.config.route53_profile = "production"
+
+            auth = Authenticator(self.config, "route53")
+            creds = auth.r53._request_signer._credentials
+            self.assertEqual(creds.access_key, "AKIA_PRODUCTION_ACCOUNT_KEY")
+            self.assertEqual(creds.secret_key, "production_account_secret")
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_ec2_instance_role_path_unaffected_by_awscredentials_isolation(self) -> None:
+        """The IMDS/container-credential isolation added to
+        --dns-route53-awscredentials must not leak into the separate,
+        untouched legacy path (no credentials file at all) that real
+        EC2-instance-role deployments rely on -- the most common way to
+        run this plugin on EC2. Confirms, with a mocked IMDS response
+        standing in for an attached instance role:
+          1. the legacy no-file path resolves via the instance role,
+          2. --dns-route53-awscredentials with a *valid* file resolves
+             from the file without ever touching the (mocked) IMDS
+             endpoint at all,
+          3. a legacy-path Authenticator constructed *after* that -- as
+             certbot renew would for a second lineage -- still resolves
+             via the instance role, proving nothing leaked."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        # setUp() leaves ambient dummy AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+        # set for the other tests in this class; remove them here so the
+        # legacy path actually has to fall through to the (mocked) instance
+        # role rather than resolving from those first.
+        del os.environ["AWS_ACCESS_KEY_ID"]
+        del os.environ["AWS_SECRET_ACCESS_KEY"]
+
+        # boto3.client(...) (the legacy path's implementation) reuses a
+        # process-global default session that caches its first resolved
+        # credentials -- unrelated to anything in this PR, but setUp()
+        # already triggered one resolution using the dummy env vars above,
+        # so reset it here to get a genuinely fresh resolution.
+        import boto3
+        boto3.DEFAULT_SESSION = None
+
+        fake_role_creds = {
+            "access_key": "AKIAEC2ROLEEXAMPLE",
+            "secret_key": "ec2rolesecret",
+            "token": "ec2roletoken",
+            "expiry_time": "2099-01-01T00:00:00Z",
+            "role_name": "fake-ec2-instance-role",
+        }
+
+        with mock.patch(
+            "botocore.utils.InstanceMetadataFetcher.retrieve_iam_role_credentials",
+            return_value=fake_role_creds,
+        ) as mock_imds:
+            # (1) legacy path -- no credentials file at all
+            legacy_config = mock.MagicMock(
+                route53_credentials=None, route53_awscredentials=None,
+                route53_profile=None, route53_region=None,
+            )
+            legacy_auth = Authenticator(legacy_config, "route53")
+            self.assertEqual(
+                legacy_auth.r53._request_signer._credentials.access_key,
+                "AKIAEC2ROLEEXAMPLE",
+            )
+            self.assertTrue(mock_imds.called)
+            mock_imds.reset_mock()
+
+            # (2) --dns-route53-awscredentials with a *valid* file resolves
+            # from the file and never even calls the mocked IMDS provider
+            with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+                credentials_file.write(
+                    "[default]\naws_access_key_id = AKIAFROMFILE\n"
+                    "aws_secret_access_key = filesecret\n"
+                )
+                credentials_file.close()
+
+            try:
+                aws_config = mock.MagicMock(
+                    route53_credentials=None,
+                    route53_awscredentials=credentials_file.name,
+                    route53_profile=None, route53_region=None,
+                )
+                aws_auth = Authenticator(aws_config, "route53")
+                self.assertEqual(
+                    aws_auth.r53._request_signer._credentials.access_key,
+                    "AKIAFROMFILE",
+                )
+                self.assertFalse(mock_imds.called)
+            finally:
+                os.unlink(credentials_file.name)
+
+            # (3) a subsequent legacy-path lineage still resolves via the
+            # instance role -- the isolation from (2) didn't leak into it
+            boto3.DEFAULT_SESSION = None
+            legacy_auth_2 = Authenticator(legacy_config, "route53")
+            self.assertEqual(
+                legacy_auth_2.r53._request_signer._credentials.access_key,
+                "AKIAEC2ROLEEXAMPLE",
+            )
+            self.assertTrue(mock_imds.called)
+
+    def test_awscredentials_file_ambient_aws_profile_does_not_override(self) -> None:
+        """An ambient AWS_PROFILE env var must not silently substitute for
+        --dns-route53-profile / the file's own [default] section."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        multi_profile_creds = """[default]
+aws_access_key_id = AKIA_DEFAULT_ACCOUNT_KEY
+aws_secret_access_key = default_account_secret
+
+[other]
+aws_access_key_id = AKIA_OTHER_ACCOUNT_KEY
+aws_secret_access_key = other_account_secret
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(multi_profile_creds)
+            credentials_file.close()
+
+        os.environ["AWS_PROFILE"] = "other"
+        try:
+            self.config.route53_awscredentials = credentials_file.name
+            # route53_profile stays None -- must resolve the file's own
+            # [default] section, not whatever AWS_PROFILE points at.
+
+            auth = Authenticator(self.config, "route53")
+            creds = auth.r53._request_signer._credentials
+            self.assertEqual(creds.access_key, "AKIA_DEFAULT_ACCOUNT_KEY")
+        finally:
+            os.unlink(credentials_file.name)
+            del os.environ["AWS_PROFILE"]
+
+    def test_awscredentials_file_role_arn_in_aws_config_not_consulted(self) -> None:
+        """A role_arn under a same-named profile in the system's real
+        ~/.aws/config must never be consulted -- otherwise boto3 would try
+        an STS AssumeRole call instead of using the static keys in the
+        file the user explicitly pointed us at."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+        from certbot.compat import filesystem
+
+        with tempfile.TemporaryDirectory() as fake_home:
+            aws_dir = os.path.join(fake_home, ".aws")
+            filesystem.makedirs(aws_dir)
+
+            # certbot forbids the builtin open()/os.makedirs() for writing
+            # files directly; filesystem.open() (paired with os.fdopen(),
+            # matching certbot's own internal usage pattern) is the
+            # sanctioned low-level equivalent.
+            config_path = os.path.join(aws_dir, "config")
+            fd = filesystem.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(
+                    "[profile shared]\n"
+                    "role_arn = arn:aws:iam::123456789012:role/example\n"
+                    "source_profile = shared\n"
+                )
+
+            with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+                credentials_file.write(
+                    "[shared]\n"
+                    "aws_access_key_id = AKIASHAREDSTATIC\n"
+                    "aws_secret_access_key = sharedstaticsecret\n"
+                )
+                credentials_file.close()
+
+            try:
+                self.config.route53_awscredentials = credentials_file.name
+                self.config.route53_profile = "shared"
+
+                old_home = os.environ.get("HOME")
+                os.environ["HOME"] = fake_home
+                try:
+                    auth = Authenticator(self.config, "route53")
+                    creds = auth.r53._request_signer._credentials
+                    self.assertEqual(creds.access_key, "AKIASHAREDSTATIC")
+                finally:
+                    if old_home is None:
+                        del os.environ["HOME"]
+                    else:
+                        os.environ["HOME"] = old_home
+            finally:
+                os.unlink(credentials_file.name)
+
+    def test_renew_sequential_authenticators_do_not_leak_credentials(self) -> None:
+        """certbot renew constructs a fresh Authenticator per lineage,
+        sequentially, in one process. Two lineages using
+        --dns-route53-awscredentials with the SAME profile name but
+        DIFFERENT files must each resolve their own file's keys, with no
+        leakage between them."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as file_a:
+            file_a.write("[prod]\naws_access_key_id = AKIALINEAGEA\n"
+                          "aws_secret_access_key = lineageasecret\n")
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as file_b:
+            file_b.write("[prod]\naws_access_key_id = AKIALINEAGEB\n"
+                          "aws_secret_access_key = lineagebsecret\n")
+
+        try:
+            config_a = mock.MagicMock(
+                route53_credentials=None, route53_awscredentials=file_a.name,
+                route53_profile="prod", route53_region=None,
+            )
+            config_b = mock.MagicMock(
+                route53_credentials=None, route53_awscredentials=file_b.name,
+                route53_profile="prod", route53_region=None,
+            )
+
+            auth_a = Authenticator(config_a, "route53")
+            self.assertNotIn("AWS_SHARED_CREDENTIALS_FILE", os.environ)
+
+            auth_b = Authenticator(config_b, "route53")
+            self.assertNotIn("AWS_SHARED_CREDENTIALS_FILE", os.environ)
+
+            self.assertEqual(
+                auth_a.r53._request_signer._credentials.access_key, "AKIALINEAGEA")
+            self.assertEqual(
+                auth_b.r53._request_signer._credentials.access_key, "AKIALINEAGEB")
+        finally:
+            os.unlink(file_a.name)
+            os.unlink(file_b.name)
+
+    def test_renew_sequential_mixed_awscredentials_then_flat_credentials(self) -> None:
+        """One lineage using --dns-route53-awscredentials followed by
+        another using --dns-route53-credentials, back to back in the same
+        process -- the second must resolve correctly with nothing left
+        over from the first."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as file_a:
+            file_a.write("[prod]\naws_access_key_id = AKIAAWSSTYLE\n"
+                          "aws_secret_access_key = awsstylesecret\n")
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as file_b:
+            file_b.write("aws_access_key_id=AKIAFLATSTYLE\n"
+                          "aws_secret_access_key=flatstylesecret\n")
+
+        try:
+            config_a = mock.MagicMock(
+                route53_credentials=None, route53_awscredentials=file_a.name,
+                route53_profile="prod", route53_region=None,
+            )
+            config_b = mock.MagicMock(
+                route53_credentials=file_b.name, route53_awscredentials=None,
+                route53_profile=None, route53_region=None,
+            )
+
+            auth_a = Authenticator(config_a, "route53")
+            auth_b = Authenticator(config_b, "route53")
+
+            self.assertEqual(
+                auth_a.r53._request_signer._credentials.access_key, "AKIAAWSSTYLE")
+            self.assertEqual(
+                auth_b.r53._request_signer._credentials.access_key, "AKIAFLATSTYLE")
+        finally:
+            os.unlink(file_a.name)
+            os.unlink(file_b.name)
+
+    def test_awscredentials_file_no_valid_keys_never_hits_network(self) -> None:
+        """When the requested profile section exists but has no usable
+        keys, get_credentials() exhausts the whole resolver chain, which
+        (verified empirically via CI: an unclosed-socket warning to
+        169.254.169.254 surfaced on an unrelated test) falls through to
+        the EC2 instance-metadata-service provider and makes a real
+        network connection. On real EC2/ECS/EKS infrastructure -- exactly
+        where this plugin commonly runs -- that could silently authenticate
+        as the instance's own IAM identity instead of raising a clear
+        error about the file. This must never touch the network at all."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        # [default] section exists (so boto3.Session doesn't raise
+        # ProfileNotFound), but has no actual keys -- forces get_credentials()
+        # to exhaust every provider in the chain before giving up.
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write("[default]\n")
+            credentials_file.close()
+
+        def spy_connect(self: Any, address: Any, *a: Any, **kw: Any) -> Any:
+            raise AssertionError(
+                f"credential resolution made a real network connection to {address} "
+                "-- AWS_EC2_METADATA_DISABLED/container-credential isolation regressed"
+            )
+
+        try:
+            self.config.route53_awscredentials = credentials_file.name
+
+            with mock.patch.object(socket.socket, "connect", spy_connect):
                 with self.assertRaises(errors.PluginError):
                     Authenticator(self.config, "route53")
         finally:
@@ -605,6 +849,118 @@ class ClientTest(unittest.TestCase):
         with mock.patch("certbot_dns_route53._internal.dns_route53.time.sleep"):
             with self.assertRaises(errors.PluginError):
                 self.client._wait_for_change("1")
+
+
+class ParseFlatKeyValueFileTest(unittest.TestCase):
+    """Direct coverage for the shared line-parser both
+    _scan_inline_overrides and _client_from_flat_credentials_file now
+    delegate to, instead of each duplicating their own line-by-line scan."""
+    # pylint: disable=protected-access
+
+    def test_parses_all_recognized_fields(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = """aws_access_key_id=AKIAEXAMPLE
+aws_secret_access_key=secretexample
+aws_session_token=tokenexample
+dns_route53_profile=myprofile
+dns_route53_region=us-east-1
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.access_key, "AKIAEXAMPLE")
+            self.assertEqual(fields.secret_key, "secretexample")
+            self.assertEqual(fields.session_token, "tokenexample")
+            self.assertEqual(fields.profile, "myprofile")
+            self.assertEqual(fields.region, "us-east-1")
+        finally:
+            os.unlink(f.name)
+
+    def test_skips_comments_blank_lines_and_section_headers(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = """# a comment
+; another comment style
+
+[default]
+aws_access_key_id=AKIAEXAMPLE
+aws_secret_access_key=secretexample
+this line has no equals sign and should just be skipped
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.access_key, "AKIAEXAMPLE")
+            self.assertEqual(fields.secret_key, "secretexample")
+            self.assertIsNone(fields.profile)
+            self.assertIsNone(fields.region)
+        finally:
+            os.unlink(f.name)
+
+    def test_first_occurrence_wins_across_key_aliases(self) -> None:
+        """dns_route53_profile and certbot_dns_route53_profile are aliases
+        for the same field -- whichever appears first in the file wins,
+        regardless of which alias it is."""
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = """dns_route53_profile=first-alias-wins
+certbot_dns_route53_profile=second-alias-loses
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.profile, "first-alias-wins")
+        finally:
+            os.unlink(f.name)
+
+    def test_reversed_alias_order_still_honors_file_order(self) -> None:
+        """Same as above but with the aliases appearing in the opposite
+        order, to confirm it's file line order that decides -- not the
+        order aliases happen to be listed in code."""
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = """certbot_dns_route53_profile=first-alias-wins
+dns_route53_profile=second-alias-loses
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.profile, "first-alias-wins")
+        finally:
+            os.unlink(f.name)
+
+    def test_values_are_stripped_of_surrounding_quotes(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = """aws_access_key_id="AKIAEXAMPLE"
+aws_secret_access_key='secretexample'
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.access_key, "AKIAEXAMPLE")
+            self.assertEqual(fields.secret_key, "secretexample")
+        finally:
+            os.unlink(f.name)
+
+    def test_missing_file_raises_oserror(self) -> None:
+        """Raises rather than swallowing the error -- each caller decides
+        for itself how strictly to treat a read failure."""
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        with self.assertRaises(OSError):
+            _parse_flat_key_value_file("/nonexistent/path/to/creds.ini")
 
 
 if __name__ == "__main__":

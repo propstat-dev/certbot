@@ -2,17 +2,19 @@
 import collections
 import logging
 import time
+from contextlib import contextmanager
 from typing import Any
 from typing import Callable
 from typing import Iterable
+from typing import Iterator
+from typing import NamedTuple
 from typing import Optional
 from typing import cast
 
 import boto3
-from botocore.credentials import Credentials
-from botocore.credentials import SharedCredentialProvider
 from botocore.exceptions import ClientError
 from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import ProfileNotFound
 
 from acme import challenges
 from certbot import achallenges
@@ -42,10 +44,104 @@ _PROFILE_KEYS = ("certbot_dns_route53_profile", "dns_route53_profile")
 _REGION_KEYS = ("certbot_dns_route53_region", "dns_route53_region")
 
 
-class Authenticator(common.Plugin, interfaces.Authenticator):
-    """DNS Authenticator for Amazon AWS Route53 
+class _FlatFileFields(NamedTuple):
+    """Fields recognized in a flat key=value credentials file. Populated
+    by _parse_flat_key_value_file and consumed by both
+    --dns-route53-credentials (which needs every field) and the
+    dns_route53_profile/dns_route53_region inline-override scan used by
+    --dns-route53-awscredentials (which only needs profile/region)."""
+    access_key: Optional[str]
+    secret_key: Optional[str]
+    session_token: Optional[str]
+    profile: Optional[str]
+    region: Optional[str]
 
-    This authenticator  uses the AWS Route53 API to fulfill a dns-01 challenge.
+
+def _parse_flat_key_value_file(creds_file: str) -> _FlatFileFields:
+    """Single-pass, line-by-line parse of creds_file as a flat set of
+    key=value pairs. [section] header lines, if present, are tolerated but
+    ignored -- the whole file is read as one flat namespace, so no section
+    header is required. NOTE: because sections are ignored, a file with
+    more than one real credential set under different [section]s is not
+    safely supported here -- use --dns-route53-awscredentials for that
+    instead. Comments (#, ;) and blank lines are skipped. For each field,
+    the first matching key encountered wins, checked across all of that
+    field's recognized aliases in file line order -- e.g. if both
+    dns_route53_profile and its certbot_-prefixed alias appear, whichever
+    comes first in the file wins, regardless of alias.
+
+    Raises whatever open()/iteration raises (OSError on a missing/unreadable
+    file); callers decide how strictly to treat that."""
+    access_key = secret_key = session_token = profile = region = None
+    with open(creds_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith(";") \
+                    or line.startswith("["):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().lower()
+            v = v.strip().strip('"').strip("'")
+
+            if k in _ACCESS_KEY_KEYS and access_key is None:
+                access_key = v
+            elif k in _SECRET_KEY_KEYS and secret_key is None:
+                secret_key = v
+            elif k in _SESSION_TOKEN_KEYS and session_token is None:
+                session_token = v
+            elif k in _PROFILE_KEYS and profile is None:
+                profile = v
+            elif k in _REGION_KEYS and region is None:
+                region = v
+    return _FlatFileFields(access_key, secret_key, session_token, profile, region)
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    """self.conf(...)/os.environ.get(...) can hand back non-str values;
+    normalize anything that isn't a real string to None."""
+    return value if isinstance(value, str) else None
+
+
+# Cleared (not merely left alone) for the duration of
+# --dns-route53-awscredentials's credential resolution -- each of these
+# can otherwise silently outrank or substitute for the file the caller
+# explicitly pointed us at. See _client_from_aws_credentials_file.
+_ISOLATED_AWS_ENV_VARS = (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN", "AWS_PROFILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+)
+
+
+@contextmanager
+def _scoped_env(overrides: dict[str, Optional[str]]) -> Iterator[None]:
+    """Temporarily apply env var overrides (None means unset that var),
+    restoring every previous value on exit regardless of how the block
+    exits."""
+    old_values = {var: os.environ.get(var) for var in overrides}
+    for var, value in overrides.items():
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = value
+    try:
+        yield
+    finally:
+        for var, old in old_values.items():
+            if old is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = old
+
+
+class Authenticator(common.Plugin, interfaces.Authenticator):
+    """DNS Authenticator for Amazon AWS Route53.
+
+    This authenticator uses the AWS Route53 API to fulfill a dns-01 challenge.
     """
 
     description = ('Obtain certificates using a DNS TXT record (if you are using AWS Route53 for '
@@ -56,21 +152,11 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
         super().__init__(*args, **kwargs)
 
         # Extract values, strictly ensuring they are strings or fallback to environment variables
-        profile = self.conf("profile") or os.environ.get("CERTBOT_DNS_ROUTE53_PROFILE")
-        if not isinstance(profile, str):
-            profile = None
-
-        region = self.conf("region") or os.environ.get("CERTBOT_DNS_ROUTE53_REGION")
-        if not isinstance(region, str):
-            region = None
-
-        creds_file = self.conf("credentials")
-        if not isinstance(creds_file, str):
-            creds_file = None
-
-        aws_creds_file = self.conf("awscredentials")
-        if not isinstance(aws_creds_file, str):
-            aws_creds_file = None
+        profile = _str_or_none(
+            self.conf("profile") or os.environ.get("CERTBOT_DNS_ROUTE53_PROFILE"))
+        region = _str_or_none(self.conf("region") or os.environ.get("CERTBOT_DNS_ROUTE53_REGION"))
+        creds_file = _str_or_none(self.conf("credentials"))
+        aws_creds_file = _str_or_none(self.conf("awscredentials"))
 
         if creds_file and aws_creds_file:
             raise errors.PluginError(
@@ -100,28 +186,20 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
     @staticmethod
     def _scan_inline_overrides(creds_file: str, profile: Optional[str],
                                 region: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-        """Scan every line of creds_file for dns_route53_profile/dns_route53_region
-        overrides, regardless of what [section] (if any) they sit under. The first
-        occurrence of each wins; an already-set profile/region (from CLI or env) is
-        never overridden."""
+        """Scan creds_file for dns_route53_profile/dns_route53_region
+        overrides via _parse_flat_key_value_file, regardless of what
+        [section] (if any) they sit under. An already-set profile/region
+        (from CLI or env) is never overridden. Read failures are tolerated
+        here rather than raised -- --dns-route53-awscredentials's own
+        credential resolution gets the chance to raise its own, clearer
+        error afterward if the file turns out to be genuinely unusable."""
         try:
-            with open(creds_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or line.startswith(";"):
-                        continue
-                    if "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    k = k.strip().lower()
-                    v = v.strip().strip('"').strip("'")
-                    if k in _PROFILE_KEYS and profile is None:
-                        profile = v
-                    if k in _REGION_KEYS and region is None:
-                        region = v
+            fields = _parse_flat_key_value_file(creds_file)
         except (OSError, ValueError) as e:
             logger.debug("Failed parsing inline overrides in %s: %s", creds_file, e)
-        return profile, region
+            return profile, region
+        return (profile if profile is not None else fields.profile,
+                region if region is not None else fields.region)
 
     def _client_from_flat_credentials_file(self, creds_file: str, profile: Optional[str],
                                             region: Optional[str]) -> Any:
@@ -132,42 +210,22 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
         if not os.path.exists(creds_file):
             raise errors.PluginError(f"Credentials file {creds_file} does not exist")
 
-        access_key = None
-        secret_key = None
-        session_token = None
-
         try:
-            with open(creds_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or line.startswith(";") \
-                            or line.startswith("["):
-                        continue
-                    if "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    k = k.strip().lower()
-                    v = v.strip().strip('"').strip("'")
-
-                    if k in _ACCESS_KEY_KEYS and access_key is None:
-                        access_key = v
-                    elif k in _SECRET_KEY_KEYS and secret_key is None:
-                        secret_key = v
-                    elif k in _SESSION_TOKEN_KEYS and session_token is None:
-                        session_token = v
-                    elif k in _PROFILE_KEYS and profile is None:
-                        profile = v
-                    elif k in _REGION_KEYS and region is None:
-                        region = v
+            fields = _parse_flat_key_value_file(creds_file)
         except OSError as e:
             raise errors.PluginError(f"Error reading credentials file {creds_file}: {e}")
 
-        if access_key and secret_key:
+        if profile is None:
+            profile = fields.profile
+        if region is None:
+            region = fields.region
+
+        if fields.access_key and fields.secret_key:
             return boto3.client(
                 "route53",
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                aws_session_token=session_token,
+                aws_access_key_id=fields.access_key,
+                aws_secret_access_key=fields.secret_key,
+                aws_session_token=fields.session_token,
                 region_name=region,
             )
         elif profile:
@@ -185,30 +243,49 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
                                            region: Optional[str]) -> Any:
         """--dns-route53-awscredentials: a genuine, section-aware AWS-style
         credentials file (like ~/.aws/credentials). profile selects which
-        [section] supplies the actual keys, so this correctly supports a
-        single file holding multiple distinct credential sets."""
+        [section] supplies the actual keys.
+
+        Resolution is delegated to boto3, redirected at creds_file via
+        AWS_SHARED_CREDENTIALS_FILE, but otherwise fully isolated from the
+        ambient process environment for the duration of this call --
+        matching the original SharedCredentialProvider-only behavior.
+        Without this isolation, ambient AWS_ACCESS_KEY_ID/AWS_PROFILE/etc.
+        can silently outrank creds_file, a same-named role_arn in
+        ~/.aws/config can trigger an unwanted AssumeRole, and an
+        unresolvable profile falls through to a real network call to the
+        EC2 instance-metadata service (169.254.169.254) -- security-
+        relevant on the EC2/ECS/EKS infrastructure this plugin commonly
+        runs on. See _ISOLATED_AWS_ENV_VARS for the full set of env vars
+        this clears. --dns-route53-credentials (the flat-file path) is
+        already immune to all of this, since it builds its client from
+        explicitly-extracted keys rather than delegating to boto3.
+
+        The isolation is scoped to just this call, so it's safe across
+        certbot renew's sequential per-lineage processing."""
         if not os.path.exists(creds_file):
             raise errors.PluginError(f"Credentials file {creds_file} does not exist")
 
         profile, region = self._scan_inline_overrides(creds_file, profile, region)
 
-        creds = cast(Optional[Credentials], SharedCredentialProvider(
-            creds_filename=creds_file,
-            profile_name=profile,
-        ).load())
-        if creds is None:
-            raise errors.PluginError(
-                f"Couldn't load AWS credentials from {creds_file}"
-                + (f" using profile '{profile}'" if profile else " using the 'default' profile")
-            )
+        overrides: dict[str, Optional[str]] = dict.fromkeys(_ISOLATED_AWS_ENV_VARS)
+        overrides["AWS_SHARED_CREDENTIALS_FILE"] = creds_file
+        overrides["AWS_CONFIG_FILE"] = os.devnull
+        overrides["AWS_EC2_METADATA_DISABLED"] = "true"
 
-        return boto3.client(
-            "route53",
-            aws_access_key_id=creds.access_key,
-            aws_secret_access_key=creds.secret_key,
-            aws_session_token=creds.token,
-            region_name=region,
-        )
+        with _scoped_env(overrides):
+            try:
+                session = boto3.Session(profile_name=profile, region_name=region)
+                creds = session.get_credentials()
+            except ProfileNotFound:
+                creds = None
+
+            if creds is None:
+                raise errors.PluginError(
+                    f"Couldn't load AWS credentials from {creds_file}"
+                    + (f" using profile '{profile}'" if profile else
+                       " using the 'default' profile")
+                )
+            return session.client("route53")
 
     def more_info(self) -> str:
         return "Solve a DNS01 challenge using AWS Route53"
