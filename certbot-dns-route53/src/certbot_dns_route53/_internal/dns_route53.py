@@ -32,11 +32,12 @@ INSTRUCTIONS = (
     "https://certbot-dns-route53.readthedocs.io/en/stable/ ")
 
 # Recognized keys within a --dns-route53-credentials file. Section headers
-# (e.g. "[default]") are tolerated but ignored -- the file is treated as a
-# flat set of key=value pairs, so no section header is required at all.
-# NOTE: because sections are ignored, a file with more than one real
-# credential set under different [section]s is not safely supported here --
-# use --dns-route53-awscredentials for that instead.
+# (e.g. "[default]") are tolerated but ignored for parsing purposes -- the
+# file is treated as a flat set of key=value pairs, so no section header is
+# required at all. A file with more than one [section] header alongside
+# literal keys is refused outright (see _client_from_flat_credentials_file)
+# rather than silently using whichever section came first -- use
+# --dns-route53-awscredentials for a file with more than one credential set.
 _ACCESS_KEY_KEYS = ("aws_access_key_id",)
 _SECRET_KEY_KEYS = ("aws_secret_access_key",)
 _SESSION_TOKEN_KEYS = ("aws_session_token", "aws_security_token")
@@ -55,6 +56,7 @@ class _FlatFileFields(NamedTuple):
     session_token: Optional[str]
     profile: Optional[str]
     region: Optional[str]
+    section_count: int
 
 
 def _parse_flat_key_value_file(creds_file: str) -> _FlatFileFields:
@@ -71,13 +73,19 @@ def _parse_flat_key_value_file(creds_file: str) -> _FlatFileFields:
     comes first in the file wins, regardless of alias.
 
     Raises whatever open()/iteration raises (OSError on a missing/unreadable
-    file); callers decide how strictly to treat that."""
+    file); callers decide how strictly to treat that. section_count is the
+    number of [section]-style header lines seen, so --dns-route53-credentials
+    can detect and refuse a file that looks like it actually holds more than
+    one profile, rather than silently using whichever key came first."""
     access_key = secret_key = session_token = profile = region = None
+    section_count = 0
     with open(creds_file, "r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith(";") \
                     or line.startswith("["):
+                if line.startswith("[") and line.endswith("]"):
+                    section_count += 1
                 continue
             if "=" not in line:
                 continue
@@ -95,7 +103,7 @@ def _parse_flat_key_value_file(creds_file: str) -> _FlatFileFields:
                 profile = v
             elif k in _REGION_KEYS and region is None:
                 region = v
-    return _FlatFileFields(access_key, secret_key, session_token, profile, region)
+    return _FlatFileFields(access_key, secret_key, session_token, profile, region, section_count)
 
 
 def _str_or_none(value: Any) -> Optional[str]:
@@ -138,6 +146,48 @@ def _scoped_env(overrides: dict[str, Optional[str]]) -> Iterator[None]:
                 os.environ[var] = old
 
 
+def _log_resolved_credentials(source: str, access_key: Optional[str],
+                               profile: Optional[str],
+                               sts_client_factory: Optional[Callable[[], Any]] = None) -> None:
+    """Log whether AWS credentials were resolved, and via what source/
+    profile, so "which profile/account created this certificate" is
+    answerable from the log file afterward. Never logs the access key
+    (or any other credential material) itself.
+
+    If sts_client_factory is given, also makes a best-effort
+    sts:GetCallerIdentity call using the already-resolved credentials, to
+    log a verified ARN/account rather than just "which file/profile we
+    pointed at". This needs no IAM permissions at all -- confirmed via
+    AWS's own docs: GetCallerIdentity still succeeds even under an
+    explicit deny policy, since the same information is returned either
+    way. It's still wrapped in a broad except: verified empirically that
+    a blocked network path (e.g. a restrictive corporate proxy) can raise
+    botocore.parsers.ResponseParserError, which is not a botocore/AWS SDK
+    exception subclass at all -- so nothing narrower is guaranteed to
+    catch every way this optional enrichment step could fail, and it must
+    never be able to break actual certificate issuance."""
+    profile_suffix = f' (Profile "{profile}")' if profile else ""
+    if not access_key:
+        logger.info("certbot-dns-route53: No AWS credentials found via %s%s",
+                     source, profile_suffix)
+        return
+
+    identity_suffix = ""
+    if sts_client_factory is not None:
+        try:
+            identity = sts_client_factory().get_caller_identity()
+            identity_suffix = (
+                f' -- verified identity: {identity.get("Arn", "<unknown>")} '
+                f'(account {identity.get("Account", "<unknown>")})')
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "certbot-dns-route53: sts:GetCallerIdentity check failed "
+                "(non-fatal, continuing without it): %s", e)
+
+    logger.info("certbot-dns-route53: Found credentials via %s%s%s",
+                source, profile_suffix, identity_suffix)
+
+
 class Authenticator(common.Plugin, interfaces.Authenticator):
     """DNS Authenticator for Amazon AWS Route53.
 
@@ -171,12 +221,27 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
         else:
             # Standard legacy code path: environment variables, ~/.aws/credentials,
             # AWS_CONFIG_FILE, or an explicit --dns-route53-profile/--dns-route53-region
-            # against that same standard chain.
-            if profile or region:
+            # against that same standard chain. Always build an explicit
+            # boto3.Session() (fully public API) rather than the bare
+            # boto3.client("route53") convenience function, even when no
+            # profile/region is given: the convenience function relies on
+            # boto3's module-global DEFAULT_SESSION, which isn't clearly
+            # public API (even boto3-focused write-ups avoid depending on
+            # it), so there'd be no safe way to read back which identity it
+            # resolved to for logging. The cost is that each lineage
+            # re-resolves credentials instead of reusing one cached
+            # module-global session across a certbot renew run -- a minor,
+            # undocumented performance detail, not a correctness one.
+            try:
                 session = boto3.Session(profile_name=profile, region_name=region)
-                self.r53 = session.client("route53")
-            else:
-                self.r53 = boto3.client("route53")
+                creds = session.get_credentials()
+            except ProfileNotFound as e:
+                raise errors.PluginError(f"Couldn't load AWS credentials: {e}")
+            _log_resolved_credentials(
+                "the standard AWS credential chain",
+                creds.access_key if creds else None, profile,
+                sts_client_factory=lambda: session.client("sts"))
+            self.r53 = session.client("route53")
 
         self._attempt_cleanup = False
         self._resource_records: collections.defaultdict[str, list[dict[str, str]]] = \
@@ -203,10 +268,15 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
 
     def _client_from_flat_credentials_file(self, creds_file: str, profile: Optional[str],
                                             region: Optional[str]) -> Any:
-        """--dns-route53-credentials: a flat key=value file. [section] header
-        lines, if present, are skipped but not tracked -- the whole file is
-        read as one namespace, so no section header is required. Only use
-        this for a file holding a single credential set."""
+        """--dns-route53-credentials: a flat key=value file. A single
+        [section] header, if present, is skipped but not tracked -- the
+        whole file is read as one namespace, so no section header is
+        required. Only use this for a file holding a single credential
+        set: if more than one [section] header is present alongside
+        literal keys, that's refused outright rather than silently using
+        whichever section's keys happened to appear first -- --dns-route53-profile
+        can't select between them here, since profile is only ever
+        consulted as a fallback when no literal keys are found at all."""
         if not os.path.exists(creds_file):
             raise errors.PluginError(f"Credentials file {creds_file} does not exist")
 
@@ -221,6 +291,25 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
             region = fields.region
 
         if fields.access_key and fields.secret_key:
+            if fields.section_count > 1:
+                raise errors.PluginError(
+                    f"Credentials file {creds_file} contains {fields.section_count} "
+                    "[section] headers alongside literal AWS keys. "
+                    "--dns-route53-credentials only supports a single flat credential "
+                    "set -- any keys beyond the first section would be silently "
+                    "ignored, and --dns-route53-profile cannot select between "
+                    "sections here. Use --dns-route53-awscredentials instead for a "
+                    "file with more than one profile."
+                )
+            _log_resolved_credentials(
+                f"--dns-route53-credentials {creds_file}",
+                fields.access_key, None,
+                sts_client_factory=lambda: boto3.client(
+                    "sts",
+                    aws_access_key_id=fields.access_key,
+                    aws_secret_access_key=fields.secret_key,
+                    aws_session_token=fields.session_token,
+                ))
             return boto3.client(
                 "route53",
                 aws_access_key_id=fields.access_key,
@@ -231,7 +320,16 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
         elif profile:
             # No literal keys in the file -- fall back to a named profile
             # from the standard AWS config/credentials chain.
-            session = boto3.Session(profile_name=profile, region_name=region)
+            try:
+                session = boto3.Session(profile_name=profile, region_name=region)
+                creds = session.get_credentials()
+            except ProfileNotFound as e:
+                raise errors.PluginError(f"Couldn't load AWS credentials: {e}")
+            _log_resolved_credentials(
+                f"--dns-route53-credentials {creds_file} (profile fallback, "
+                "no literal keys in file)",
+                creds.access_key if creds else None, profile,
+                sts_client_factory=lambda: session.client("sts"))
             return session.client("route53")
         else:
             raise errors.PluginError(
@@ -285,6 +383,10 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
                     + (f" using profile '{profile}'" if profile else
                        " using the 'default' profile")
                 )
+            _log_resolved_credentials(
+                f"--dns-route53-awscredentials {creds_file}",
+                creds.access_key, profile,
+                sts_client_factory=lambda: session.client("sts"))
             return session.client("route53")
 
     def more_info(self) -> str:
