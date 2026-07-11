@@ -138,6 +138,113 @@ this line has no equals sign and should just be skipped
             with self.assertRaises(errors.PluginError):
                 Authenticator(self.config, "route53")
 
+    def test_credentials_file_missing_does_not_fall_back_to_ambient_credentials(self) -> None:
+        """A missing --dns-route53-credentials file must fail outright,
+        not silently fall back to ambient AWS_ACCESS_KEY_ID/
+        AWS_SECRET_ACCESS_KEY -- which setUp() already leaves set for
+        every test in this class -- or to a real ~/.aws/credentials."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+        from certbot.compat import filesystem
+
+        with tempfile.TemporaryDirectory() as fake_home:
+            aws_dir = os.path.join(fake_home, ".aws")
+            filesystem.makedirs(aws_dir)
+            fd = filesystem.open(
+                os.path.join(aws_dir, "credentials"),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write("[default]\naws_access_key_id=AKIAREALHOMEDIR\n"
+                         "aws_secret_access_key=realhomedirsecret\n")
+
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = fake_home
+            try:
+                self.config.route53_credentials = os.path.join(fake_home, "nope.ini")
+                with self.assertRaises(errors.PluginError):
+                    Authenticator(self.config, "route53")
+            finally:
+                if old_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = old_home
+
+    def test_credentials_file_multiple_sections_refused(self) -> None:
+        """A --dns-route53-credentials file with more than one [section]
+        header alongside literal keys must be refused outright, rather
+        than silently using whichever section's keys happened to come
+        first -- --dns-route53-profile can't select between sections
+        here, so silently succeeding would be a silent wrong-account
+        footgun."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        multi_section = """[default]
+aws_access_key_id=AKIAIOSFODNN7EXAMPLE
+aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+[alternativeProfileA]
+aws_access_key_id=AKIAIOSFODNN7EXAMPLE
+aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+[alternativeProfileB]
+aws_access_key_id=AKIAIOSFODNN7EXAMPLE
+aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(multi_section)
+            credentials_file.close()
+
+        try:
+            self.config.route53_credentials = credentials_file.name
+            with self.assertRaises(errors.PluginError):
+                Authenticator(self.config, "route53")
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_credentials_file_multiple_sections_refused_even_with_profile_flag(self) -> None:
+        """Passing --dns-route53-profile alongside a multi-section flat
+        file must not silently succeed by picking the wrong section --
+        it still needs to be refused, since profile is never actually
+        consulted once literal keys are found."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        multi_section = """[default]
+aws_access_key_id=AKIADEFAULTKEY
+aws_secret_access_key=defaultsecret
+[alternativeProfileB]
+aws_access_key_id=AKIAALTBKEY
+aws_secret_access_key=altbsecret
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(multi_section)
+            credentials_file.close()
+
+        try:
+            self.config.route53_credentials = credentials_file.name
+            self.config.route53_profile = "alternativeProfileB"
+            with self.assertRaises(errors.PluginError):
+                Authenticator(self.config, "route53")
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_credentials_file_single_section_still_works(self) -> None:
+        """A single [default] section (the normal, documented case) must
+        not be affected by the multi-section check."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        single_section = """[default]
+aws_access_key_id=AKIAIOSFODNN7EXAMPLE
+aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(single_section)
+            credentials_file.close()
+
+        try:
+            self.config.route53_credentials = credentials_file.name
+            auth = Authenticator(self.config, "route53")
+            creds = auth.r53._request_signer._credentials
+            self.assertEqual(creds.access_key, "AKIAIOSFODNN7EXAMPLE")
+        finally:
+            os.unlink(credentials_file.name)
+
     def test_awscredentials_file_inline_profile_pointer(self) -> None:
         """--dns-route53-awscredentials with the profile/region specified
         inline (in [default]) rather than via a CLI flag."""
@@ -178,6 +285,34 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         with mock.patch("certbot_dns_route53._internal.dns_route53.os.path.exists", return_value=False):
             with self.assertRaises(errors.PluginError):
                 Authenticator(self.config, "route53")
+
+    def test_awscredentials_file_missing_does_not_fall_back_to_ambient_credentials(self) -> None:
+        """Same guarantee as the --dns-route53-credentials case, for
+        --dns-route53-awscredentials."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+        from certbot.compat import filesystem
+
+        with tempfile.TemporaryDirectory() as fake_home:
+            aws_dir = os.path.join(fake_home, ".aws")
+            filesystem.makedirs(aws_dir)
+            fd = filesystem.open(
+                os.path.join(aws_dir, "credentials"),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write("[default]\naws_access_key_id=AKIAREALHOMEDIR\n"
+                         "aws_secret_access_key=realhomedirsecret\n")
+
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = fake_home
+            try:
+                self.config.route53_awscredentials = os.path.join(fake_home, "nope.ini")
+                with self.assertRaises(errors.PluginError):
+                    Authenticator(self.config, "route53")
+            finally:
+                if old_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = old_home
 
     def test_credentials_and_awscredentials_are_mutually_exclusive(self) -> None:
         from certbot_dns_route53._internal.dns_route53 import Authenticator
@@ -961,6 +1096,38 @@ aws_secret_access_key='secretexample'
 
         with self.assertRaises(OSError):
             _parse_flat_key_value_file("/nonexistent/path/to/creds.ini")
+
+    def test_section_count_tracks_distinct_section_headers(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = """[default]
+aws_access_key_id = AKIADEFAULTEXAMPLE
+aws_secret_access_key = defaultsecret1234567890
+[other]
+aws_access_key_id = AKIAOTHEREXAMPLE
+aws_secret_access_key = othersecret1234567890
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.section_count, 2)
+        finally:
+            os.unlink(f.name)
+
+    def test_section_count_zero_when_no_sections(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import _parse_flat_key_value_file
+
+        content = "aws_access_key_id=AKIAFLATEXAMPLE\naws_secret_access_key=flatsecret\n"
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(content)
+            f.close()
+        try:
+            fields = _parse_flat_key_value_file(f.name)
+            self.assertEqual(fields.section_count, 0)
+        finally:
+            os.unlink(f.name)
 
 
 if __name__ == "__main__":
