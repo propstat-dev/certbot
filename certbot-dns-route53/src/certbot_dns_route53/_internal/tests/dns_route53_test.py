@@ -85,7 +85,7 @@ class AuthenticatorTest(unittest.TestCase):
             ) as mock_client:
                 Authenticator(self.config, "route53")
 
-                mock_client.assert_called_once_with(
+                mock_client.assert_any_call(
                     "route53",
                     aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
                     aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -119,7 +119,7 @@ this line has no equals sign and should just be skipped
             ) as mock_client:
                 Authenticator(self.config, "route53")
 
-                mock_client.assert_called_once_with(
+                mock_client.assert_any_call(
                     "route53",
                     aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
                     aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -273,7 +273,7 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
                 mock_session.assert_called_once_with(
                     profile_name="production", region_name="us-east-1",
                 )
-                mock_session.return_value.client.assert_called_once_with("route53")
+                mock_session.return_value.client.assert_any_call("route53")
         finally:
             os.unlink(credentials_file.name)
 
@@ -340,7 +340,27 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
             mock_session.assert_called_once_with(
                 profile_name="myprofile", region_name="eu-west-1",
             )
-            mock_session.return_value.client.assert_called_once_with("route53")
+            mock_session.return_value.client.assert_any_call("route53")
+
+    def test_legacy_path_profile_not_found_raises_clean_plugin_error(self) -> None:
+        """--dns-route53-profile pointing at a profile that doesn't exist
+        anywhere (e.g. the whole ~/.aws directory is missing) must raise a
+        clean PluginError, not a raw, uncaught botocore.exceptions.ProfileNotFound."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        with tempfile.TemporaryDirectory() as fake_home:
+            # deliberately no .aws directory at all
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = fake_home
+            try:
+                self.config.route53_profile = "doesnotexistanywhere"
+                with self.assertRaises(errors.PluginError):
+                    Authenticator(self.config, "route53")
+            finally:
+                if old_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = old_home
 
     def test_credentials_file_session_token(self) -> None:
         """A flat credentials file may also carry a temporary
@@ -363,7 +383,7 @@ aws_session_token=FQoGZXIvYXdzEXAMPLETOKEN
             ) as mock_client:
                 Authenticator(self.config, "route53")
 
-                mock_client.assert_called_once_with(
+                mock_client.assert_any_call(
                     "route53",
                     aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
                     aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -394,9 +414,34 @@ aws_session_token=FQoGZXIvYXdzEXAMPLETOKEN
                 mock_session.assert_called_once_with(
                     profile_name="myprofile", region_name=None,
                 )
-                mock_session.return_value.client.assert_called_once_with("route53")
+                mock_session.return_value.client.assert_any_call("route53")
         finally:
             os.unlink(credentials_file.name)
+
+    def test_credentials_file_profile_fallback_not_found_raises_clean_plugin_error(self) -> None:
+        """Same gap as the legacy path, in the flat-file profile-fallback
+        branch: a profile pointer (from the file or --dns-route53-profile)
+        that doesn't exist anywhere must raise a clean PluginError."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        profile_only = "dns_route53_profile=doesnotexistanywhere\n"
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(profile_only)
+            credentials_file.close()
+
+        with tempfile.TemporaryDirectory() as fake_home:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = fake_home
+            try:
+                self.config.route53_credentials = credentials_file.name
+                with self.assertRaises(errors.PluginError):
+                    Authenticator(self.config, "route53")
+            finally:
+                os.unlink(credentials_file.name)
+                if old_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = old_home
 
     def test_credentials_file_no_keys_no_profile_raises(self) -> None:
         """A flat credentials file with neither literal keys nor a profile
@@ -550,14 +595,6 @@ aws_secret_access_key = production_account_secret
         del os.environ["AWS_ACCESS_KEY_ID"]
         del os.environ["AWS_SECRET_ACCESS_KEY"]
 
-        # boto3.client(...) (the legacy path's implementation) reuses a
-        # process-global default session that caches its first resolved
-        # credentials -- unrelated to anything in this PR, but setUp()
-        # already triggered one resolution using the dummy env vars above,
-        # so reset it here to get a genuinely fresh resolution.
-        import boto3
-        boto3.DEFAULT_SESSION = None
-
         fake_role_creds = {
             "access_key": "AKIAEC2ROLEEXAMPLE",
             "secret_key": "ec2rolesecret",
@@ -608,8 +645,11 @@ aws_secret_access_key = production_account_secret
                 os.unlink(credentials_file.name)
 
             # (3) a subsequent legacy-path lineage still resolves via the
-            # instance role -- the isolation from (2) didn't leak into it
-            boto3.DEFAULT_SESSION = None
+            # instance role -- the isolation from (2) didn't leak into it.
+            # (No DEFAULT_SESSION reset needed here: the legacy path now
+            # always builds an explicit boto3.Session() per lineage, so
+            # there's no module-global session state to leak between them
+            # in the first place.)
             legacy_auth_2 = Authenticator(legacy_config, "route53")
             self.assertEqual(
                 legacy_auth_2.r53._request_signer._credentials.access_key,
@@ -984,6 +1024,198 @@ class ClientTest(unittest.TestCase):
         with mock.patch("certbot_dns_route53._internal.dns_route53.time.sleep"):
             with self.assertRaises(errors.PluginError):
                 self.client._wait_for_change("1")
+
+
+class ResolvedCredentialsLoggingTest(unittest.TestCase):
+    """Confirms which profile/source was used to resolve AWS credentials
+    is logged (so 'which profile created this certificate' is answerable
+    from the log file), and confirms the access key itself is never
+    logged -- only whether one was found."""
+    # pylint: disable=protected-access
+
+    LOGGER_NAME = "certbot_dns_route53._internal.dns_route53"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config = mock.MagicMock(
+            route53_credentials=None, route53_awscredentials=None,
+            route53_profile=None, route53_region=None,
+        )
+        os.environ["AWS_ACCESS_KEY_ID"] = "dummy_access_key"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "dummy_secret_access_key"
+
+    def tearDown(self) -> None:
+        for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+            if var in os.environ:
+                del os.environ[var]
+
+    def test_awscredentials_file_logs_profile_not_access_key(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        multi_profile_creds = """[default]
+aws_access_key_id = AKIA_DEFAULT_ACCOUNT_KEY
+aws_secret_access_key = default_account_secret
+
+[production]
+aws_access_key_id = AKIA_PRODUCTION_ACCOUNT_KEY
+aws_secret_access_key = production_account_secret
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(multi_profile_creds)
+            credentials_file.close()
+
+        try:
+            self.config.route53_awscredentials = credentials_file.name
+            self.config.route53_profile = "production"
+
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+                Authenticator(self.config, "route53")
+
+            joined = "\n".join(log_ctx.output)
+            self.assertNotIn("AKIA_PRODUCTION_ACCOUNT_KEY", joined)
+            self.assertIn("Found credentials via", joined)
+            self.assertIn('Profile "production"', joined)
+            self.assertIn("--dns-route53-awscredentials", joined)
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_flat_credentials_file_literal_keys_does_not_log_access_key(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(CREDS_FILE)
+            credentials_file.close()
+
+        try:
+            self.config.route53_credentials = credentials_file.name
+
+            with mock.patch("certbot_dns_route53._internal.dns_route53.boto3.client"):
+                with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+                    Authenticator(self.config, "route53")
+
+            joined = "\n".join(log_ctx.output)
+            self.assertNotIn("AKIAIOSFODNN7EXAMPLE", joined)
+            self.assertIn("Found credentials via", joined)
+            self.assertIn("--dns-route53-credentials", joined)
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_flat_credentials_file_profile_fallback_logs_profile_not_access_key(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        profile_only = "dns_route53_profile=myprofile\n"
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as credentials_file:
+            credentials_file.write(profile_only)
+            credentials_file.close()
+
+        try:
+            self.config.route53_credentials = credentials_file.name
+
+            with mock.patch(
+                "certbot_dns_route53._internal.dns_route53.boto3.Session"
+            ) as mock_session:
+                mock_session.return_value.get_credentials.return_value.access_key = \
+                    "AKIAFALLBACKPROFILE"
+                with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+                    Authenticator(self.config, "route53")
+
+            joined = "\n".join(log_ctx.output)
+            self.assertNotIn("AKIAFALLBACKPROFILE", joined)
+            self.assertIn('Profile "myprofile"', joined)
+        finally:
+            os.unlink(credentials_file.name)
+
+    def test_legacy_path_with_profile_logs_profile_not_access_key(self) -> None:
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        self.config.route53_profile = "myprofile"
+
+        with mock.patch(
+            "certbot_dns_route53._internal.dns_route53.boto3.Session"
+        ) as mock_session:
+            mock_session.return_value.get_credentials.return_value.access_key = \
+                "AKIALEGACYPROFILE"
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+                Authenticator(self.config, "route53")
+
+        joined = "\n".join(log_ctx.output)
+        self.assertNotIn("AKIALEGACYPROFILE", joined)
+        self.assertIn('Profile "myprofile"', joined)
+
+    def test_legacy_path_no_profile_logs_source_not_access_key(self) -> None:
+        """No profile/region given via our flags -- the legacy path
+        always builds an explicit boto3.Session() (fully public API),
+        even for the bare no-profile case, so credentials do get
+        resolved and logged here too -- but still without the key."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+            Authenticator(self.config, "route53")
+
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("standard AWS credential chain", joined)
+        # setUp() leaves AWS_ACCESS_KEY_ID=dummy_access_key set -- it must
+        # resolve successfully (proving credentials were found) but never
+        # appear in the log output itself.
+        self.assertIn("Found credentials via", joined)
+        self.assertNotIn("dummy_access_key", joined)
+        # No profile was given here, so no "(Profile ...)" suffix expected.
+        self.assertNotIn("Profile", joined)
+
+    def test_sts_identity_check_success_logs_arn_and_account(self) -> None:
+        """A successful sts:GetCallerIdentity call should add a verified
+        ARN/account to the log line -- strictly more trustworthy than
+        just reporting which file/profile we pointed at."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        self.config.route53_profile = "myprofile"
+
+        with mock.patch(
+            "certbot_dns_route53._internal.dns_route53.boto3.Session"
+        ) as mock_session:
+            mock_session.return_value.get_credentials.return_value.access_key = \
+                "AKIALEGACYPROFILE"
+            mock_session.return_value.client.return_value.get_caller_identity.return_value = {
+                "Arn": "arn:aws:iam::123456789012:user/certbot-route53",
+                "Account": "123456789012",
+                "UserId": "AIDAEXAMPLE",
+            }
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+                Authenticator(self.config, "route53")
+
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("arn:aws:iam::123456789012:user/certbot-route53", joined)
+        self.assertIn("123456789012", joined)
+        self.assertNotIn("AKIALEGACYPROFILE", joined)
+
+    def test_sts_identity_check_failure_does_not_break_construction(self) -> None:
+        """The identity check must be pure best-effort: if
+        sts:GetCallerIdentity fails for any reason (network, permissions,
+        an unexpected response), Authenticator construction must still
+        succeed and the credentials must still be usable -- this is the
+        exact guarantee that matters, since it must never be able to
+        break actual certificate issuance."""
+        from certbot_dns_route53._internal.dns_route53 import Authenticator
+
+        self.config.route53_profile = "myprofile"
+
+        with mock.patch(
+            "certbot_dns_route53._internal.dns_route53.boto3.Session"
+        ) as mock_session:
+            mock_session.return_value.get_credentials.return_value.access_key = \
+                "AKIALEGACYPROFILE"
+            mock_session.return_value.client.side_effect = [
+                Exception("simulated: e.g. blocked by a corporate proxy"),  # .client("sts")
+                mock.DEFAULT,  # .client("route53") should still succeed normally
+            ]
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as log_ctx:
+                auth = Authenticator(self.config, "route53")
+
+        # construction succeeded and self.r53 is set -- nothing broke
+        self.assertTrue(hasattr(auth, "r53"))
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("Found credentials via", joined)
+        self.assertNotIn("AKIALEGACYPROFILE", joined)
 
 
 class ParseFlatKeyValueFileTest(unittest.TestCase):

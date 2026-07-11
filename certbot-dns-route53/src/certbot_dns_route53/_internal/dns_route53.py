@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = (
     "To use certbot-dns-route53, a variety of credential strategies are possible." # pylint: disable=line-too-long
-    "Consult the documentation for all options."  # pylint: disable=line-too-long
+    "Consult the documentation for all options. "  # pylint: disable=line-too-long
     "https://certbot-dns-route53.readthedocs.io/en/stable/ ")
 
 # Recognized keys within a --dns-route53-credentials file. Section headers
