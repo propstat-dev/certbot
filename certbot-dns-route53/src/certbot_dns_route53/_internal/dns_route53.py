@@ -92,6 +92,9 @@ _ISOLATED_AWS_ENV_VARS = (
 
 @contextmanager
 def _scoped_env(overrides: dict[str, Optional[str]]) -> Iterator[None]:
+    # Note: mutating os.environ is process-wide and NOT thread-safe. This is
+    # fine today because certbot runs plugin setup on a single thread, but do
+    # not move this onto a worker thread without rethinking the approach.
     old_values = {var: os.environ.get(var) for var in overrides}
     for var, value in overrides.items():
         if value is None:
@@ -271,6 +274,9 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
                 f"--dns-route53-awscredentials {creds_file}",
                 creds.access_key, profile,
                 sts_client_factory=lambda: session.client("sts"))
+            # The client is created inside the _scoped_env block on purpose:
+            # get_credentials() above resolves credentials eagerly, so the
+            # client remains valid after the environment is restored.
             return session.client("route53")
 
     def more_info(self) -> str:
