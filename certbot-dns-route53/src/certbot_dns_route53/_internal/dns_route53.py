@@ -113,7 +113,10 @@ def _log_resolved_credentials(source: str, access_key: Optional[str],
                                sts_client_factory: Optional[Callable[[], Any]] = None) -> None:
     profile_suffix = f' (Profile "{profile}")' if profile else ""
     if not access_key:
-        logger.info("certbot-dns-route53: No AWS credentials found via %s%s", source, profile_suffix)
+        logger.info(
+            "certbot-dns-route53: No AWS credentials found via %s%s",
+            source, profile_suffix
+        )
         return
 
     identity_suffix = ""
