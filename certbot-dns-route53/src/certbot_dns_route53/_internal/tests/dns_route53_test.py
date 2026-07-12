@@ -42,6 +42,21 @@ class AuthenticatorTest(unittest.TestCase):
         os.environ["AWS_ACCESS_KEY_ID"] = "dummy_access_key"
         os.environ["AWS_SECRET_ACCESS_KEY"] = "dummy_secret_access_key"
 
+        # _log_resolved_credentials makes a real sts:GetCallerIdentity call to
+        # verify+log the resolved identity whenever credentials resolve
+        # successfully. With these dummy-but-resolvable env credentials,
+        # constructing an Authenticator would otherwise open a real
+        # connection to AWS on every single test -- slow/flaky, and on old
+        # botocore (no working client.close()) it leaks an unclosed SSL
+        # socket that surfaces as a ResourceWarning failure in some unrelated
+        # test once pytest's unraisable-exception hook catches up with it.
+        # This is covered in isolation by ResolvedCredentialsLoggingTest, so
+        # it doesn't need to run for real here.
+        patcher = mock.patch(
+            "certbot_dns_route53._internal.dns_route53._log_resolved_credentials")
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
         self.auth = Authenticator(self.config, "route53")
 
     def tearDown(self):
@@ -151,6 +166,14 @@ class ClientTest(unittest.TestCase):
         # Set up dummy credentials for testing
         os.environ["AWS_ACCESS_KEY_ID"] = "dummy_access_key"
         os.environ["AWS_SECRET_ACCESS_KEY"] = "dummy_secret_access_key"
+
+        # See the matching comment in AuthenticatorTest.setUp: this avoids a
+        # real sts:GetCallerIdentity network call (and the socket leak it
+        # can cause on old botocore) on every test in this class.
+        patcher = mock.patch(
+            "certbot_dns_route53._internal.dns_route53._log_resolved_credentials")
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
         self.client = Authenticator(self.config, "route53")
 
@@ -292,7 +315,13 @@ class CredentialsFileTest(unittest.TestCase):
         from certbot_dns_route53._internal.dns_route53 import Authenticator
         self.config.route53_credentials = self._write(
             "aws_access_key_id=AKIAEXAMPLE\naws_secret_access_key=secretexample\n")
-        auth = Authenticator(self.config, "route53")
+        # Real (fake) access key + secret resolve successfully, so this would
+        # otherwise trigger a real sts:GetCallerIdentity call. See the
+        # comment in AuthenticatorTest.setUp for why that's a problem here.
+        with mock.patch(
+            "certbot_dns_route53._internal.dns_route53._log_resolved_credentials"
+        ):
+            auth = Authenticator(self.config, "route53")
         creds = auth.r53._request_signer._credentials
         self.assertEqual(creds.access_key, "AKIAEXAMPLE")
 
@@ -352,7 +381,12 @@ class AwsCredentialsFileTest(unittest.TestCase):
             "[default]\naws_access_key_id=AKIADEFAULT\naws_secret_access_key=defaultsecret\n"
             "[production]\naws_access_key_id=AKIAPROD\naws_secret_access_key=prodsecret\n")
         self.config.route53_awsprofile = "production"
-        auth = Authenticator(self.config, "route53")
+        # See the comment in AuthenticatorTest.setUp: a resolvable profile
+        # here would otherwise trigger a real sts:GetCallerIdentity call.
+        with mock.patch(
+            "certbot_dns_route53._internal.dns_route53._log_resolved_credentials"
+        ):
+            auth = Authenticator(self.config, "route53")
         creds = auth.r53._request_signer._credentials
         self.assertEqual(creds.access_key, "AKIAPROD")
 

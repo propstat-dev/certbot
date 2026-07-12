@@ -145,26 +145,29 @@ def _log_resolved_credentials(source: str, access_key: Optional[str],
                 del sts_client
                 gc.collect()
 
-    logger.info("certbot-dns-route53: Found credentials via %s%s%s", source, profile_suffix, identity_suffix)
+    logger.info(
+        "certbot-dns-route53: Found credentials via %s%s%s",
+        source, profile_suffix, identity_suffix
+    )
 
 
 class Authenticator(common.Plugin, interfaces.Authenticator):
     """DNS Authenticator for Amazon AWS Route53."""
 
-    description = 'Obtain certificates using a DNS TXT record (if you are using AWS Route53 for DNS).'
+    description = 'Obtain certificates using a DNS TXT record (if you are using AWS Route53 for DNS).' # pylint: disable=line-too-long
     ttl = 10
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-        profile = _str_or_none(self.conf("awsprofile") or os.environ.get("CERTBOT_DNS_ROUTE53_AWSPROFILE"))
+        profile = _str_or_none(self.conf("awsprofile") or os.environ.get("CERTBOT_DNS_ROUTE53_AWSPROFILE")) # pylint: disable=line-too-long
         region = _str_or_none(self.conf("region") or os.environ.get("CERTBOT_DNS_ROUTE53_REGION"))
         creds_file = _str_or_none(self.conf("credentials"))
         aws_creds_file = _str_or_none(self.conf("awscredentials"))
 
         if creds_file and aws_creds_file:
             raise errors.PluginError(
-                "Only one of --dns-route53-credentials or --dns-route53-awscredentials may be specified."
+                "Only one of --dns-route53-credentials or --dns-route53-awscredentials may be specified." # pylint: disable=line-too-long
             )
 
         if aws_creds_file:
@@ -184,7 +187,7 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
             self.r53 = session.client("route53")
 
         self._attempt_cleanup = False
-        self._resource_records: collections.defaultdict[str, list[dict[str, str]]] = collections.defaultdict(list)
+        self._resource_records: collections.defaultdict[str, list[dict[str, str]]] = collections.defaultdict(list) # pylint: disable=line-too-long
         self._resource_records_change_ids: dict[str, str] = {}
 
     @staticmethod
@@ -209,11 +212,13 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
 
         if not fields.access_key or not fields.secret_key:
             raise errors.PluginError(
-                f"Credentials file {creds_file} must contain aws_access_key_id and aws_secret_access_key."
+                f"Credentials file {creds_file} must contain aws_access_key_id and aws_secret_access_key." # pylint: disable=line-too-long
             )
 
         if fields.section_count > 1:
-            raise errors.PluginError(f"Credentials file {creds_file} cannot contain multiple sections.")
+            raise errors.PluginError(
+                f"Credentials file {creds_file} cannot contain multiple sections."
+            )
 
         if fields.region and region is None:
             region = fields.region
@@ -272,12 +277,12 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
     def add_parser_arguments(cls, add: Callable[..., None]) -> None:
         super().add_parser_arguments(add)
         add('credentials', help='Load AWS credentials from a simple flat key=value file.')
-        add('awscredentials', help='Load AWS credentials from a standard AWS-style credentials file.')
+        add('awscredentials', help='Load AWS credentials from a standard AWS-style credentials file.') # pylint: disable=line-too-long
         add('awsprofile', help='AWS profile name to use.')
         add('region', help='AWS region name to use.')
 
     def auth_hint(self, failed_achalls: list[achallenges.AnnotatedChallenge]) -> str:
-        return 'The Certificate Authority failed to verify the DNS TXT records created by --dns-route53.'
+        return 'The Certificate Authority failed to verify the DNS TXT records created by --dns-route53.' # pylint: disable=line-too-long
 
     def prepare(self) -> None:
         pass
@@ -373,7 +378,10 @@ class Authenticator(common.Plugin, interfaces.Authenticator):
             if response["ChangeInfo"]["Status"] == "INSYNC":
                 return
             time.sleep(5)
-        raise errors.PluginError("Timed out waiting for Route53 change. Current status: %s" % response["ChangeInfo"]["Status"])
+        raise errors.PluginError(
+            "Timed out waiting for Route53 change. Current status: %s" %
+            response["ChangeInfo"]["Status"]
+        )
 
 
 class HiddenAuthenticator(Authenticator):
