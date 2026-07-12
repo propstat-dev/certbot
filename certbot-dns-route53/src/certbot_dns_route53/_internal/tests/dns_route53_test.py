@@ -304,7 +304,7 @@ class CredentialsFileTest(unittest.TestCase):
         self.config = mock.MagicMock(route53_credentials=None, route53_awscredentials=None,
                                       route53_awsprofile=None, route53_region=None)
 
-    def _write(self, content):
+    def _write(self, content: str) -> str:
         f = tempfile.NamedTemporaryFile(mode="w", delete=False)
         f.write(content)
         f.close()
@@ -368,7 +368,7 @@ class AwsCredentialsFileTest(unittest.TestCase):
         self.config = mock.MagicMock(route53_credentials=None, route53_awscredentials=None,
                                       route53_awsprofile=None, route53_region=None)
 
-    def _write(self, content):
+    def _write(self, content: str) -> str:
         f = tempfile.NamedTemporaryFile(mode="w", delete=False)
         f.write(content)
         f.close()
@@ -441,7 +441,7 @@ class ResolvedCredentialsLoggingTest(unittest.TestCase):
             def __del__(self):
                 warnings.warn("unclosed", ResourceWarning)
 
-        escaped = []
+        escaped: list[sys.UnraisableHookArgs] = []
         old_hook = sys.unraisablehook
         sys.unraisablehook = escaped.append
         try:
